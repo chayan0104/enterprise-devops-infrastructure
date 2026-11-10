@@ -1,0 +1,152 @@
+// Declarative pipeline: Terraform infrastructure
+//
+// Infrastructure permissions are deliberately separate from application
+// deployment permissions:
+//   ehd-<env>-terraform-deploy : VPC/ALB/EC2/EKS/ECR/Secrets Manager/IAM (infra)
+//   ehd-app-deploy             : ECR push, SSM deploy command, EKS describe (app)
+// Jenkins assumes the infra role only for this pipeline. Plan output is stored
+// as an artifact and the SAME plan file is applied after approval.
+pipeline {
+  agent { label 'terraform' }
+
+  options {
+    timestamps()
+    buildDiscarder(logRotator(numToKeepStr: '30'))
+    timeout(time: 60, unit: 'MINUTES')
+    disableConcurrentBuilds() // never two applies against the same state
+  }
+
+  parameters {
+    choice(name: 'ENVIRONMENT', choices: ['uat', 'prod'], description: 'Environment to plan/apply')
+    choice(name: 'ACTION', choices: ['plan', 'apply'], description: 'plan = dry run, apply = change infrastructure')
+    string(name: 'CHANGE_ID', defaultValue: '', description: 'Required for apply')
+  }
+
+  environment {
+    AWS_REGION   = 'eu-west-1'
+    TF_IN_AUTOMATION = 'true'
+    TF_INPUT     = '0'
+    TF_VERSION   = '1.9.8'
+    WORK_DIR     = "terraform/environments/${params.ENVIRONMENT}"
+    STATE_BUCKET = "ehd-tfstate-${params.ENVIRONMENT == 'prod' ? '444455556666' : '111122223333'}"
+    INFRA_ROLE_ARN = "arn:aws:iam::${params.ENVIRONMENT == 'prod' ? '444455556666' : '111122223333'}:role/ehd-${params.ENVIRONMENT}-terraform-deploy"
+  }
+
+  stages {
+    stage('Checkout') {
+      steps {
+        checkout scm
+        sh 'terraform version'
+      }
+    }
+
+    stage('Terraform fmt') {
+      steps {
+        // Fails if files are not formatted: keeps reviews focused on logic.
+        sh 'terraform fmt -check -recursive -diff terraform/'
+      }
+    }
+
+    stage('Init') {
+      steps {
+        withAWS(role: env.INFRA_ROLE_ARN, roleSessionName: "jenkins-tf-init-${BUILD_NUMBER}", region: env.AWS_REGION) {
+          dir(env.WORK_DIR) {
+            sh '''
+              terraform init -input=false \
+                -backend-config="bucket=${STATE_BUCKET}" \
+                -backend-config="region=${AWS_REGION}"
+            '''
+          }
+        }
+      }
+    }
+
+    stage('Validate') {
+      steps {
+        dir(env.WORK_DIR) {
+          sh 'terraform validate'
+        }
+      }
+    }
+
+    stage('Security Scan') {
+      steps {
+        dir(env.WORK_DIR) {
+          sh '''
+            # Static IaC scan. HIGH/CRITICAL findings fail the build unless
+            # explicitly baselined in .trivyignore.
+            trivy config --exit-code 1 --severity HIGH,CRITICAL \
+              --ignorefile "${WORKSPACE}/.trivyignore" .
+          '''
+        }
+      }
+    }
+
+    stage('Plan') {
+      steps {
+        withAWS(role: env.INFRA_ROLE_ARN, roleSessionName: "jenkins-tf-plan-${BUILD_NUMBER}", region: env.AWS_REGION) {
+          dir(env.WORK_DIR) {
+            // Secret values for Secrets Manager are injected from the Jenkins
+            // credential store; they never exist in Git or in a tfvars file.
+            withCredentials([string(credentialsId: 'ehd-secret-values-json', variable: 'SECRET_VALUES')]) {
+              sh '''
+                export TF_VAR_secret_values="$SECRET_VALUES"
+                export TF_VAR_change_id="${CHANGE_ID:-jenkins-${BUILD_NUMBER}}"
+                export TF_VAR_terraform_role_arn="$INFRA_ROLE_ARN"
+                terraform plan -input=false -lock-timeout=5m -out=tfplan.bin
+                terraform show -no-color tfplan.bin > tfplan.txt
+              '''
+            }
+            archiveArtifacts artifacts: 'tfplan.bin,tfplan.txt'
+            sh 'grep -E "Plan:|No changes" tfplan.txt || true'
+          }
+        }
+      }
+    }
+
+    stage('Approval') {
+      when { expression { params.ACTION == 'apply' } }
+      steps {
+        script {
+          if (!params.CHANGE_ID) {
+            error 'CHANGE_ID is required when ACTION=apply'
+          }
+        }
+        timeout(time: 24, unit: 'HOURS') {
+          // Prod applies additionally require platform-lead approval.
+          input message: "Apply Terraform to ${params.ENVIRONMENT}?", ok: 'Apply',
+                submitter: params.ENVIRONMENT == 'prod' ? 'platform-leads' : 'platform-engineering'
+        }
+      }
+    }
+
+    stage('Apply') {
+      when { expression { params.ACTION == 'apply' } }
+      steps {
+        withAWS(role: env.INFRA_ROLE_ARN, roleSessionName: "jenkins-tf-apply-${BUILD_NUMBER}", region: env.AWS_REGION) {
+          dir(env.WORK_DIR) {
+            withCredentials([string(credentialsId: 'ehd-secret-values-json', variable: 'SECRET_VALUES')]) {
+              sh '''
+                export TF_VAR_secret_values="$SECRET_VALUES"
+                export TF_VAR_change_id="$CHANGE_ID"
+                export TF_VAR_terraform_role_arn="$INFRA_ROLE_ARN"
+                terraform apply -input=false -lock-timeout=5m tfplan.bin
+                terraform output -no-color > terraform-outputs.txt
+              '''
+            }
+            archiveArtifacts artifacts: 'terraform-outputs.txt'
+          }
+        }
+      }
+    }
+  }
+
+  post {
+    always {
+      dir(env.WORK_DIR) {
+        sh 'terraform -chdir=. version >/dev/null 2>&1 || true'
+      }
+    }
+    failure { echo 'Terraform pipeline failed. Inspect the failing stage; no partial apply runs without a saved plan.' }
+  }
+}

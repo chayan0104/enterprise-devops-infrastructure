@@ -1,0 +1,33 @@
+# Internal ALB ingress (AWS Load Balancer Controller is a platform prerequisite).
+# The WildFly application reaches these endpoints through the internal ALB, so
+# scheme is internal and inbound-cidrs is the VPC range only.
+# DNS for the ALB hostname is created by the DNS team; Route 53 is out of scope.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: order-service
+  namespace: ehd-apps
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internal
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/group.name: ehd-microservices
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}, {"HTTPS": 443}]'
+    alb.ingress.kubernetes.io/ssl-redirect: "443"
+    alb.ingress.kubernetes.io/certificate-arn: arn:aws:acm:eu-west-1:444455556666:certificate/REPLACE-EXISTING-CERT
+    alb.ingress.kubernetes.io/inbound-cidrs: 10.50.0.0/16
+    alb.ingress.kubernetes.io/healthcheck-path: /actuator/health/readiness
+    alb.ingress.kubernetes.io/success-codes: "200"
+    alb.ingress.kubernetes.io/load-balancer-attributes: routing.http2.enabled=true,idle_timeout.timeout_seconds=60
+spec:
+  ingressClassName: alb
+  rules:
+    - host: order-service.internal.ehd.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: order-service
+                port:
+                  number: 8080

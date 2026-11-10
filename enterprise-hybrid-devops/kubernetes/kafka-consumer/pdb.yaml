@@ -1,0 +1,12 @@
+# Voluntary disruptions during draining must keep at least one consumer alive,
+# so offsets stay committed and no partition is left without an owner.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: kafka-consumer
+  namespace: ehd-apps
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kafka-consumer

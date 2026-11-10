@@ -1,0 +1,15 @@
+# Namespace for all Spring Boot services and Kafka consumers.
+# Pod Security Admission "restricted" is enforced, so every container must run
+# as non-root, drop Linux capabilities and use the default seccomp profile
+# (the Deployments below do all three).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ehd-apps
+  labels:
+    name: ehd-apps
+    environment: prod
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted

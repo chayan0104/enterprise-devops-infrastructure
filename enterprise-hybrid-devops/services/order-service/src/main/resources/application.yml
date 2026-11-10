@@ -1,0 +1,47 @@
+server:
+  port: ${SERVER_PORT:8080}
+  shutdown: graceful # finish in-flight requests before the pod exits
+
+spring:
+  application:
+    name: order-service
+  lifecycle:
+    timeout-per-shutdown-phase: 20s
+
+# Separate management port so probes and metrics are never exposed through the
+# application ingress path.
+management:
+  server:
+    port: ${MANAGEMENT_SERVER_PORT:8081}
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      show-details: when_authorized
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+  health:
+    livenessstate:
+      enabled: true
+    readinessstate:
+      enabled: true
+
+logging:
+  level:
+    root: INFO
+    com.ehd: INFO
+  pattern:
+    # Single-line JSON-ish output is easier to ship to CloudWatch/S3.
+    console: "%d{ISO8601} %-5level [%thread] %logger{36} - %msg%n"
+
+# Existing external dependencies. Values are injected from the ConfigMap.
+ehd:
+  oracle:
+    host: ${ORACLE_HOST:not-configured}
+    port: ${ORACLE_PORT:1521}
+    service: ${ORACLE_SERVICE:not-configured}
+    # Username/password come from Secrets Manager, never from this file.
+  documents:
+    bucket: ${DOCUMENTS_BUCKET:not-configured}

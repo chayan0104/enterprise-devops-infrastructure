@@ -1,0 +1,93 @@
+# Alertmanager for UAT. Routes are placeholders: the corporate webhook and
+# SMTP relay are owned by the platform team. Do not commit real tokens; the
+# receiver credentials come from a Secret created by External Secrets.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alertmanager-config
+  namespace: monitoring
+data:
+  alertmanager.yml: |
+    global:
+      resolve_timeout: 5m
+
+    route:
+      receiver: platform-oncall
+      group_by: [alertname, environment]
+      group_wait: 30s
+      group_interval: 5m
+      repeat_interval: 4h
+      routes:
+        - matchers: ['severity="critical"']
+          receiver: platform-oncall
+          repeat_interval: 30m
+
+    receivers:
+      - name: platform-oncall
+        webhook_configs:
+          - url: "REPLACE-corporate-oncall-webhook"
+            send_resolved: true
+        # email_configs:
+        #   - to: "platform-oncall@example.com"
+        #     from: "alertmanager@example.com"
+        #     smarthost: "REPLACE-smtp-relay:587"
+        #     auth_username_file: /etc/alertmanager/secrets/smtp-user
+        #     auth_password_file: /etc/alertmanager/secrets/smtp-password
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alertmanager
+  namespace: monitoring
+  labels: { app.kubernetes.io/name: alertmanager }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app.kubernetes.io/name: alertmanager }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: alertmanager }
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        fsGroup: 65534
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: alertmanager
+          image: prom/alertmanager:v0.27.0
+          args:
+            - --config.file=/etc/alertmanager/alertmanager.yml
+            - --storage.path=/alertmanager
+          ports:
+            - containerPort: 9093
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { cpu: 200m, memory: 256Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - name: config
+              mountPath: /etc/alertmanager
+            - name: data
+              mountPath: /alertmanager
+      volumes:
+        - name: config
+          configMap:
+            name: alertmanager-config
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: alertmanager
+  namespace: monitoring
+spec:
+  type: ClusterIP
+  selector: { app.kubernetes.io/name: alertmanager }
+  ports:
+    - name: http
+      port: 9093
+      targetPort: 9093

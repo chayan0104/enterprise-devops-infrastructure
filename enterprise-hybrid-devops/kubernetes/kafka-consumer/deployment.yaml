@@ -1,0 +1,100 @@
+# Kafka consumer runs as its own Deployment so it can be scaled, deployed and
+# monitored independently from the HTTP microservices. It consumes from the
+# EXISTING external/self-managed Kafka cluster (SASL_SSL + SCRAM).
+#
+# Consumer group = deployment name. Replicas beyond the topic partition count
+# would idle, so maxReplicas is capped at the partition count (6 here).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kafka-consumer
+  namespace: ehd-apps
+  labels:
+    app.kubernetes.io/name: kafka-consumer
+    app.kubernetes.io/part-of: enterprise-hybrid-devops
+    app.kubernetes.io/component: consumer
+spec:
+  replicas: 2
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kafka-consumer
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1 # a rebalance happens anyway; keep it to one pod
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kafka-consumer
+        app.kubernetes.io/part-of: enterprise-hybrid-devops
+    spec:
+      serviceAccountName: kafka-consumer
+      terminationGracePeriodSeconds: 60 # finish the in-flight batch, then commit offsets
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: kafka-consumer
+          image: 444455556666.dkr.ecr.eu-west-1.amazonaws.com/ehd-prod/kafka-consumer:bootstrap
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: management
+              containerPort: 8081
+          envFrom:
+            - configMapRef:
+                name: ehd-microservices-config
+          env:
+            - name: KAFKA_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: kafka-consumer-secrets
+                  key: kafka-credentials.json
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "384Mi"
+            limits:
+              cpu: "700m"
+              memory: "768Mi"
+          startupProbe:
+            httpGet: { path: /actuator/health/readiness, port: management }
+            periodSeconds: 10
+            failureThreshold: 30
+          readinessProbe:
+            httpGet: { path: /actuator/health/readiness, port: management }
+            periodSeconds: 15
+            failureThreshold: 3
+          livenessProbe:
+            httpGet: { path: /actuator/health/liveness, port: management }
+            periodSeconds: 30
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              # Let the consumer finish its current records and commit offsets.
+              exec:
+                command: ["sh", "-c", "sleep 20"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: secrets-store
+              mountPath: /mnt/secrets-store
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: secrets-store
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: kafka-consumer-secrets
+        - name: tmp
+          emptyDir: {}

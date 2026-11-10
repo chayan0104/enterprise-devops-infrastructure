@@ -1,0 +1,12 @@
+# PodDisruptionBudget keeps the service available during node drains and
+# cluster upgrades. With 2+ replicas, one pod may be evicted voluntarily.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: order-service
+  namespace: ehd-apps
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: order-service

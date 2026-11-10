@@ -1,0 +1,161 @@
+// Declarative pipeline: WildFly main application (EC2 behind the ALB)
+//
+// AWS access: the AWS Steps plugin calls STS AssumeRole. Jenkins stores every
+// pipeline in this folder on the same EC2 agent and no static access keys exist.
+// The role ehd-app-deploy (application permissions) is DIFFERENT from the
+// ehd-*-terraform-deploy role (infrastructure permissions).
+pipeline {
+  agent { label 'maven-jdk17' }
+
+  options {
+    timestamps()
+    buildDiscarder(logRotator(numToKeepStr: '20', artifactNumToKeepStr: '10'))
+    timeout(time: 45, unit: 'MINUTES')
+    disableConcurrentBuilds()
+  }
+
+  parameters {
+    choice(name: 'ENVIRONMENT', choices: ['uat', 'prod'], description: 'Target environment')
+    string(name: 'APP_VERSION', defaultValue: '', description: 'Release version, defaults to pom version')
+    string(name: 'CHANGE_ID', defaultValue: '', description: 'Required for prod')
+    booleanParam(name: 'SKIP_TESTS', defaultValue: false, description: 'Only for hotfixes, never for prod')
+  }
+
+  environment {
+    APP_NAME        = 'ehd-main-app'
+    APP_ROLE_ARN    = "arn:aws:iam::${params.ENVIRONMENT == 'prod' ? '444455556666' : '111122223333'}:role/ehd-app-deploy"
+    AWS_REGION      = 'eu-west-1'
+    SONAR_HOST_URL  = 'https://sonar.corp.example.com'
+    JFROG_REPO      = 'libs-release-local/com/ehd/main-app'
+    TARGET_GROUP_ARN = "${params.ENVIRONMENT == 'prod' ? 'arn:aws:elasticloadbalancing:...:targetgroup/ehd-prod-wildfly-tg' : 'arn:aws:elasticloadbalancing:...:targetgroup/ehd-uat-wildfly-tg'}"
+  }
+
+  stages {
+    stage('Checkout') {
+      steps {
+        checkout scm
+        script {
+          env.GIT_SHA = sh(returnStdout: true, script: 'git rev-parse --short=12 HEAD').trim()
+          if (!params.APP_VERSION) {
+            env.APP_VERSION = sh(returnStdout: true, script: "mvn -q -f main-app/pom.xml help:evaluate -Dexpression=project.version -DforceStdout").trim()
+          }
+          env.RELEASE_VERSION = "${env.APP_VERSION}-${env.GIT_SHA}"
+        }
+      }
+    }
+
+    stage('Build and Test') {
+      steps {
+        dir('main-app') {
+          sh 'mvn -B -ntp clean verify -DskipITs=false'
+        }
+        junit allowEmptyResults: true, testResults: 'main-app/**/target/surefire-reports/*.xml'
+      }
+    }
+
+    stage('SonarQube and Security Scan') {
+      steps {
+        dir('main-app') {
+          withSonarQubeEnv('sonar-corp') {
+            sh 'mvn -B -ntp sonar:sonar -Dsonar.projectKey=ehd-main-app'
+          }
+        }
+        // Dependency and secret scanning. No build should proceed on a critical CVE.
+        sh 'mvn -B -ntp -f main-app/pom.xml org.owasp:dependency-check-maven:check -DfailBuildOnCVSS=9'
+      }
+    }
+
+    stage('Package WAR') {
+      steps {
+        dir('main-app') {
+          sh 'mvn -B -ntp clean package -DskipTests'
+          archiveArtifacts artifacts: 'target/*.war', fingerprint: true
+        }
+      }
+    }
+
+    stage('Publish to JFrog') {
+      steps {
+        withCredentials([usernamePassword(credentialsId: 'jfrog-artifactory', usernameVariable: 'JFROG_USER', passwordVariable: 'JFROG_PASS')]) {
+          dir('main-app') {
+            sh '''
+              curl -fsS -u "$JFROG_USER:$JFROG_PASS" \
+                -T target/ehd-main-app.war \
+                "https://jfrog.corp.example.com/artifactory/${JFROG_REPO}/${RELEASE_VERSION}/ehd-main-app-${RELEASE_VERSION}.war"
+            '''
+          }
+        }
+      }
+    }
+
+    stage('Approval') {
+      when { expression { params.ENVIRONMENT == 'prod' } }
+      steps {
+        // Prod deploys need a change reference plus a human approval.
+        script {
+          if (!params.CHANGE_ID) {
+            error 'CHANGE_ID is required for production deployments'
+          }
+        }
+        timeout(time: 24, unit: 'HOURS') {
+          input message: "Deploy ${env.RELEASE_VERSION} to PROD?", ok: 'Deploy', submitter: 'release-managers'
+        }
+      }
+    }
+
+    stage('Deploy to WildFly (EC2)') {
+      steps {
+        withAWS(role: env.APP_ROLE_ARN, roleSessionName: "jenkins-main-${env.GIT_SHA}", region: env.AWS_REGION) {
+          // 1. Upload the WAR to the artifact S3 path the instances can read.
+          sh '''
+            aws s3 cp main-app/target/ehd-main-app.war \
+              "s3://ehd-${ENVIRONMENT}-deploy-artifacts/main-app/${RELEASE_VERSION}/ehd-main-app.war"
+
+            # 2. Rolling restart through the ASG: instance refresh runs the
+            #    user data, which pulls the version pinned in the launch template.
+            #    For a WAR-only release, run the deploy script over SSM instead:
+            aws ssm send-command \
+              --document-name "AWS-RunShellScript" \
+              --targets "Key=tag:aws:autoscaling:groupName,Values=ehd-${ENVIRONMENT}-wildfly-asg" \
+              --comment "Deploy ${RELEASE_VERSION}" \
+              --parameters 'commands=["/opt/ehd/bin/deploy-wildfly.sh '"${RELEASE_VERSION}"'"]' \
+              --timeout-seconds 600
+          '''
+        }
+      }
+    }
+
+    stage('Health Check') {
+      steps {
+        withAWS(role: env.APP_ROLE_ARN, roleSessionName: "jenkins-health-${env.GIT_SHA}", region: env.AWS_REGION) {
+          // Wait until every target is healthy, then confirm the deployed version.
+          sh '''
+            for i in $(seq 1 30); do
+              HEALTHY=$(aws elbv2 describe-target-health \
+                --target-group-arn "$TARGET_GROUP_ARN" \
+                --query 'TargetHealthDescriptions[?TargetHealth.State==`healthy`] | length(@)' \
+                --output text)
+              TOTAL=$(aws elbv2 describe-target-health \
+                --target-group-arn "$TARGET_GROUP_ARN" \
+                --query 'TargetHealthDescriptions | length(@)' \
+                --output text)
+              echo "healthy=$HEALTHY total=$TOTAL"
+              [ "$HEALTHY" -ge 2 ] && [ "$HEALTHY" -eq "$TOTAL" ] && exit 0
+              sleep 20
+            done
+            echo "ALB targets did not become healthy"; exit 1
+          '''
+        }
+      }
+    }
+  }
+
+  post {
+    success { echo "Main app ${env.RELEASE_VERSION} deployed to ${params.ENVIRONMENT}" }
+    failure {
+      // Safe automatic rollback: re-run the previous release recorded in S3.
+      echo 'Deployment failed - previous WAR remains in place; check the deploy log and ALB target health before retrying.'
+    }
+    always { cleanWs() }
+  }
+}

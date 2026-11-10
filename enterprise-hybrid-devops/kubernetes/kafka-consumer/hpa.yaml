@@ -1,0 +1,26 @@
+# CPU-based autoscaling is a starting point only. For real Kafka workloads the
+# better signal is consumer lag: install KEDA and scale on
+# kafka_consumergroup_lag (the metric is already exported by the JMX/Burrow
+# sidecar). maxReplicas must never exceed the topic partition count (6).
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: kafka-consumer
+  namespace: ehd-apps
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: kafka-consumer
+  minReplicas: 2
+  maxReplicas: 6
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 600 # avoid rebalance storms
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 75

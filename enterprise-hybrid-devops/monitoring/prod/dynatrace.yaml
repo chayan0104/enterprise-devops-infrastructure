@@ -1,0 +1,59 @@
+# PRODUCTION application + infrastructure observability: Dynatrace.
+# The Dynatrace Operator is a platform prerequisite (installed once per cluster
+# by the platform team). This file only declares the DynaKube custom resource.
+#
+# OneAgent (cloudNativeFullStack) gives:
+#   - JVM monitoring for WildFly (EC2, via OneAgent) and Spring Boot (EKS)
+#   - application performance monitoring / code-level traces
+#   - infrastructure monitoring for nodes and hosts
+#   - distributed tracing between the main app and the microservices via W3C
+#     trace headers (no manual instrumentation in the application code)
+#
+# Tokens are NOT in this file. They are synced from Secrets Manager
+# (ehd/prod/dynatrace) into the dynakube secret by External Secrets Operator.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: dynatrace
+---
+apiVersion: dynatrace.com/v1beta2
+kind: DynaKube
+metadata:
+  name: ehd-prod
+  namespace: dynatrace
+spec:
+  apiUrl: https://REPLACE-environment-id.live.dynatrace.com/api
+
+  # Full stack = per-node OneAgent for host + pod metrics, plus deep monitoring
+  # injected into the Java containers by the webhook.
+  oneAgent:
+    cloudNativeFullStack:
+      namespaceSelector:
+        matchNames: ["ehd-apps"]
+      tolerations:
+        - effect: NoSchedule
+          operator: Exists
+
+  activeGate:
+    capabilities:
+      - routing
+      - kubernetes-monitoring
+    resources:
+      requests:
+        cpu: 200m
+        memory: 512Mi
+      limits:
+        cpu: 1000m
+        memory: 1Gi
+
+  # Keep resource usage predictable on shared node groups.
+  metadataEnrichment:
+    enabled: true
+
+  templates:
+    # Align pod security with the rest of the platform.
+    oneAgent:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault

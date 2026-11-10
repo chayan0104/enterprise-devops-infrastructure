@@ -1,0 +1,188 @@
+// Declarative pipeline: Spring Boot microservices on EKS
+//
+// Same repository holds several services; SERVICE selects which one is built.
+// Immutable image tag (release-<git-sha>) makes `kubectl rollout undo` a safe
+// rollback. No long-lived AWS keys: STS AssumeRole through the AWS Steps plugin.
+pipeline {
+  agent { label 'docker-maven' }
+
+  options {
+    timestamps()
+    buildDiscarder(logRotator(numToKeepStr: '30', artifactNumToKeepStr: '5'))
+    timeout(time: 40, unit: 'MINUTES')
+  }
+
+  parameters {
+    choice(name: 'SERVICE', choices: ['order-service', 'notification-service', 'kafka-consumer'], description: 'Microservice to build (repository folder name)')
+    choice(name: 'ENVIRONMENT', choices: ['uat', 'prod'], description: 'Target environment')
+    string(name: 'CHANGE_ID', defaultValue: '', description: 'Required for prod')
+    booleanParam(name: 'SKIP_TESTS', defaultValue: false, description: 'Hotfix only')
+  }
+
+  environment {
+    AWS_REGION      = 'eu-west-1'
+    ECR_REGISTRY    = "${params.ENVIRONMENT == 'prod' ? '444455556666' : '111122223333'}.dkr.ecr.eu-west-1.amazonaws.com"
+    ECR_REPO        = "ehd-${params.ENVIRONMENT}/${params.SERVICE}"
+    APP_ROLE_ARN    = "arn:aws:iam::${params.ENVIRONMENT == 'prod' ? '444455556666' : '111122223333'}:role/ehd-app-deploy"
+    NAMESPACE       = 'ehd-apps'
+    SONAR_HOST_URL  = 'https://sonar.corp.example.com'
+    SMOKE_URL       = "${params.ENVIRONMENT == 'prod' ? 'https://order-service.internal.ehd.example.com' : 'https://order-service.uat.internal.ehd.example.com'}"
+  }
+
+  stages {
+    stage('Checkout') {
+      steps {
+        checkout scm
+        script {
+          env.GIT_SHA = sh(returnStdout: true, script: 'git rev-parse --short=12 HEAD').trim()
+          env.IMAGE_TAG = "release-${env.GIT_SHA}" // immutable, never reused
+        }
+      }
+    }
+
+    stage('Maven Build and Test') {
+      steps {
+        dir("services/${params.SERVICE}") {
+          sh 'mvn -B -ntp clean verify'
+        }
+        junit allowEmptyResults: true, testResults: "services/${params.SERVICE}/target/surefire-reports/*.xml"
+      }
+    }
+
+    stage('SonarQube and Security Scan') {
+      steps {
+        dir("services/${params.SERVICE}") {
+          withSonarQubeEnv('sonar-corp') {
+            sh "mvn -B -ntp sonar:sonar -Dsonar.projectKey=ehd-${params.SERVICE}"
+          }
+        }
+      }
+    }
+
+    stage('Docker Build') {
+      steps {
+        sh """
+          docker build \
+            --pull \
+            --label org.opencontainers.image.revision=${env.GIT_SHA} \
+            --build-arg JAR_FILE=target/${params.SERVICE}.jar \
+            -t ${params.SERVICE}:${env.IMAGE_TAG} \
+            services/${params.SERVICE}
+        """
+      }
+    }
+
+    stage('Trivy Image Scan') {
+      steps {
+        // Fail the build on HIGH/CRITICAL fixable vulnerabilities.
+        sh """
+          trivy image --exit-code 1 --ignore-unfixed \
+            --severity CRITICAL,HIGH \
+            --format table \
+            ${params.SERVICE}:${env.IMAGE_TAG}
+        """
+        sh "trivy image -f json -o trivy-${params.SERVICE}.json ${params.SERVICE}:${env.IMAGE_TAG} || true"
+        archiveArtifacts artifacts: "trivy-${params.SERVICE}.json", allowEmptyArchive: true
+      }
+    }
+
+    stage('Push to ECR') {
+      steps {
+        withAWS(role: env.APP_ROLE_ARN, roleSessionName: "jenkins-ecr-${env.GIT_SHA}", region: env.AWS_REGION) {
+          sh '''
+            aws ecr get-login-password --region "$AWS_REGION" \
+              | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+
+            docker tag "${SERVICE}:${IMAGE_TAG}" "${ECR_REGISTRY}/${ECR_REPO}:${IMAGE_TAG}"
+            docker push "${ECR_REGISTRY}/${ECR_REPO}:${IMAGE_TAG}"
+
+            # The digest is what actually gets audited and deployed.
+            aws ecr describe-images --repository-name "$ECR_REPO" --image-ids imageTag="$IMAGE_TAG" \
+              --query 'imageDetails[0].imageDigest' --output text > image-digest.txt
+          '''
+        }
+        archiveArtifacts artifacts: 'image-digest.txt'
+      }
+    }
+
+    stage('Approval') {
+      when { expression { params.ENVIRONMENT == 'prod' } }
+      steps {
+        script {
+          if (!params.CHANGE_ID) {
+            error 'CHANGE_ID is required for production deployments'
+          }
+        }
+        timeout(time: 24, unit: 'HOURS') {
+          input message: "Deploy ${env.SERVICE}:${env.IMAGE_TAG} to PROD?", ok: 'Deploy', submitter: 'release-managers'
+        }
+      }
+    }
+
+    stage('Deploy with kubectl') {
+      steps {
+        withAWS(role: env.APP_ROLE_ARN, roleSessionName: "jenkins-k8s-${env.GIT_SHA}", region: env.AWS_REGION) {
+          sh '''
+            aws eks update-kubeconfig --name "ehd-${ENVIRONMENT}" --region "$AWS_REGION"
+
+            # Manifests are plain YAML. Secrets/ConfigMaps are already in place;
+            # only the image is changed, so the rollout is deterministic.
+            kubectl apply -f kubernetes/base/
+            kubectl apply -f "kubernetes/${SERVICE}/"
+
+            kubectl -n "$NAMESPACE" set image "deployment/${SERVICE}" \
+              "${SERVICE}=${ECR_REGISTRY}/${ECR_REPO}:${IMAGE_TAG}"
+
+            kubectl -n "$NAMESPACE" annotate "deployment/${SERVICE}" \
+              kubernetes.io/change-cause="Jenkins ${BUILD_NUMBER} ${IMAGE_TAG} change=${CHANGE_ID}" --overwrite
+          '''
+        }
+      }
+    }
+
+    stage('Rollout Status') {
+      steps {
+        withAWS(role: env.APP_ROLE_ARN, roleSessionName: "jenkins-rollout-${env.GIT_SHA}", region: env.AWS_REGION) {
+          sh '''
+            aws eks update-kubeconfig --name "ehd-${ENVIRONMENT}" --region "$AWS_REGION"
+            kubectl -n "$NAMESPACE" rollout status "deployment/${SERVICE}" --timeout=240s
+            kubectl -n "$NAMESPACE" get pods -l "app.kubernetes.io/name=${SERVICE}" -o wide
+          '''
+        }
+      }
+    }
+
+    stage('Smoke Test') {
+      steps {
+        withAWS(role: env.APP_ROLE_ARN, roleSessionName: "jenkins-smoke-${env.GIT_SHA}", region: env.AWS_REGION) {
+          sh '''
+            aws eks update-kubeconfig --name "ehd-${ENVIRONMENT}" --region "$AWS_REGION"
+
+            # 1. In-cluster health check through the Service (DNS + readiness).
+            kubectl -n "$NAMESPACE" run "smoke-${BUILD_NUMBER}" --rm -i --restart=Never \
+              --image=curlimages/curl:8.10.1 --command -- \
+              curl -fsS --max-time 10 "http://${SERVICE}:8081/actuator/health/readiness"
+
+            # 2. External check only for services exposed by the ingress.
+            if [ "${SERVICE}" = "order-service" ]; then
+              curl -fsS --max-time 10 "${SMOKE_URL}/actuator/health/readiness"
+            fi
+          '''
+        }
+      }
+    }
+  }
+
+  post {
+    failure {
+      withAWS(role: env.APP_ROLE_ARN) {
+        sh '''
+          aws eks update-kubeconfig --name "ehd-${ENVIRONMENT}" --region "$AWS_REGION" || true
+          kubectl -n "$NAMESPACE" describe deployment "${SERVICE}" || true
+          kubectl -n "$NAMESPACE" logs -l "app.kubernetes.io/name=${SERVICE}" --tail=100 --all-containers || true
+        '''
+      }
+    }
+    always { cleanWs() }
+  }
+}

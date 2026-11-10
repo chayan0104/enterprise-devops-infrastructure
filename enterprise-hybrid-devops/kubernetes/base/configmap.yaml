@@ -1,0 +1,32 @@
+# Non-secret configuration shared by the microservices.
+# Endpoints here point at EXISTING external infrastructure. They are not
+# secrets, so a ConfigMap is the right place. Passwords never go in here.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ehd-microservices-config
+  namespace: ehd-apps
+  labels:
+    app.kubernetes.io/part-of: enterprise-hybrid-devops
+data:
+  SPRING_PROFILES_ACTIVE: "prod"
+  # Existing Oracle RDS primary (reached through TGW/peering, not created here)
+  ORACLE_HOST: "REPLACE-existing-oracle-host"
+  ORACLE_PORT: "1521"
+  ORACLE_SERVICE: "REPLACE_SERVICE"
+  # Existing DocumentDB (optional per service)
+  DOCUMENTDB_HOST: "REPLACE-existing-documentdb-endpoint"
+  DOCUMENTDB_PORT: "27017"
+  DOCUMENTDB_DATABASE: "documents"
+  # Existing external/self-managed Kafka
+  KAFKA_BOOTSTRAP_SERVERS: "REPLACE-kafka-broker-1:9093,REPLACE-kafka-broker-2:9093"
+  KAFKA_SECURITY_PROTOCOL: "SASL_SSL"
+  KAFKA_SASL_MECHANISM: "SCRAM-SHA-512"
+  KAFKA_TOPIC_ORDERS: "orders.events"
+  # Document storage: existing S3 bucket, access through IRSA (no static keys)
+  DOCUMENTS_BUCKET: "REPLACE-existing-documents-bucket"
+  AWS_REGION: "eu-west-1"
+  # JVM settings sized for the container limits below
+  JAVA_TOOL_OPTIONS: "-XX:MaxRAMPercentage=70 -XX:+UseG1GC -XX:+ExitOnOutOfMemoryError"
+  # Observability
+  MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE: "health,info,prometheus"

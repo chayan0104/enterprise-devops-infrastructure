@@ -1,0 +1,96 @@
+# PRODUCTION AWS-native observability.
+#
+# 1. EKS control-plane logs are enabled in Terraform
+#    (aws_eks_cluster.enabled_cluster_log_types), so api/audit/authenticator/
+#    controllerManager/scheduler already go to CloudWatch Logs group
+#    /aws/eks/ehd-prod/cluster. No extra manifest is required for that.
+# 2. This file adds Container Insights + application log shipping from the nodes
+#    with the CloudWatch agent (DaemonSet, platform prerequisite image).
+# 3. ALB access logs go straight to S3 from the ALB attribute set in Terraform.
+#
+# The agent reads credentials from the node instance role. In PROD, use IRSA
+# with the cloudwatch-agent ServiceAccount instead so no node-wide permission
+# exists. Both are shown; IRSA is the recommended one.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cloudwatch-agent
+  namespace: amazon-cloudwatch
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::444455556666:role/ehd-prod-cloudwatch-agent
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cloudwatch-agent-config
+  namespace: amazon-cloudwatch
+data:
+  # Container Insights collects node/pod CPU, memory, disk and network metrics.
+  cwagentconfig.json: |
+    {
+      "agent": { "region": "eu-west-1" },
+      "logs": {
+        "force_flush_interval": 5,
+        "metrics_collected": {
+          "kubernetes": {
+            "cluster_name": "ehd-prod",
+            "metrics_collection_interval": 60,
+            "enhanced_container_insights": false
+          }
+        }
+      },
+      "metrics": {
+        "namespace": "ContainerInsights",
+        "metrics_collected": {
+          "mem": { "measurement": ["mem_used_percent"] },
+          "cpu": { "measurement": ["cpu_usage_active"] }
+        }
+      }
+    }
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: cloudwatch-agent
+  namespace: amazon-cloudwatch
+  labels: { app.kubernetes.io/name: cloudwatch-agent }
+spec:
+  selector:
+    matchLabels: { app.kubernetes.io/name: cloudwatch-agent }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: cloudwatch-agent }
+    spec:
+      serviceAccountName: cloudwatch-agent
+      hostNetwork: true
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: cloudwatch-agent
+          image: public.ecr.aws/cloudwatch-agent/cloudwatch-agent:1.300048.0
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { cpu: 300m, memory: 384Mi }
+          env:
+            - name: CI_MAX_EVENT_SIZE
+              value: "0"
+            - name: K8S_NODE_NAME
+              valueFrom:
+                fieldRef: { fieldPath: spec.nodeName }
+            - name: HOST_IP
+              valueFrom:
+                fieldRef: { fieldPath: status.hostIP }
+          securityContext:
+            runAsUser: 0 # agent needs read-only host access; scope with RBAC below
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - { name: config, mountPath: /etc/cwagentconfig }
+            - { name: rootfs, mountPath: /rootfs, readOnly: true }
+            - { name: dockersock, mountPath: /var/run/docker.sock, readOnly: true }
+            - { name: varlibdocker, mountPath: /var/lib/docker, readOnly: true }
+      volumes:
+        - name: config
+          configMap: { name: cloudwatch-agent-config }
+        - { name: rootfs, hostPath: { path: / } }
+        - { name: dockersock, hostPath: { path: /var/run/docker.sock } }
+        - { name: varlibdocker, hostPath: { path: /var/lib/docker } }

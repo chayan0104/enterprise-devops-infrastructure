@@ -1,0 +1,15 @@
+# Trivy findings that were reviewed and accepted, with a reason and an expiry.
+# Keep this file short: an entry without a reason is a finding nobody fixed.
+#
+# Format: <id> <free text> exp:<YYYY-MM-DD>
+#
+# AVD-AWS-0057 "IAM policy should avoid use of wildcards"
+#   Reason: the EKS node role uses AWS managed AmazonEKSWorkerNodePolicy; the
+#   managed policy is not editable and the effective scope is documented in
+#   docs/OPERATIONS.md.
+#   exp:2026-06-30
+#
+# AVD-AWS-0086 "Missing description for security group"
+#   Reason: description is set on every group in the security-groups module;
+#   the flag was a false positive on the dynamic egress rule.
+#   exp:2026-03-31
