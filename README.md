@@ -1,81 +1,248 @@
-# enterprise-hybrid-devops · control plane
+# enterprise-hybrid-devops
 
-This repository contains two things that belong together:
+A deliberately small, production-oriented hybrid deployment for an enterprise
+Java estate:
 
-1. **`enterprise-hybrid-devops/`** — the actual DevOps project: seven Terraform
-   modules, UAT/PROD roots, plain Kubernetes manifests, three Jenkins
-   pipelines, a reference Spring Boot service, UAT/PROD monitoring, and the
-   README/operations/troubleshooting documentation.
-2. **The Next.js control plane in `src/`** — a small, database-backed portal that
-   makes the project reviewable: architecture and traffic flow, module and
-   environment comparison, Kubernetes manifest explanations, pipeline stages, a
-   deployment history you can roll back, secret/IAM flows, and a searchable
-   runbook.
+- **WildFly main application** on EC2 behind a public Application Load Balancer.
+- **Spring Boot microservices** (and Kafka consumers) on EKS, images in ECR.
+- **Terraform** for infrastructure, **Jenkins** for delivery, **plain YAML** for
+  Kubernetes, **AWS Secrets Manager** for credentials.
+- **Existing dependencies are not provisioned:** Oracle RDS primary,
+  DocumentDB, external/self-managed Kafka, external SFTP. Endpoints are inputs.
 
-Start with [`enterprise-hybrid-devops/README.md`](enterprise-hybrid-devops/README.md)
-for the architecture, and
-[`enterprise-hybrid-devops/docs/TROUBLESHOOTING.md`](enterprise-hybrid-devops/docs/TROUBLESHOOTING.md)
-for the incident runbooks.
+Everything here is intended to be explained in an interview without hand-waving:
+seven Terraform modules, three pipelines, one Kubernetes namespace pattern.
 
-## Console pages
+---
 
-| Route | What it shows |
-| --- | --- |
-| `/` | Architecture diagram, traffic flow, UAT/PROD workload state, recent deployments |
-| `/infrastructure` | Terraform modules and decisions, UAT vs PROD matrix, external dependencies, exclusions, repository map |
-| `/kubernetes` | Workload shape per component, manifest explorer with plain-language explanations, prerequisites |
-| `/pipelines` | Stage-by-stage pipeline map, deploy console, rollback, IAM separation |
-| `/monitoring` | UAT Prometheus stack, PROD Dynatrace + CloudWatch, S3 log archive and retention |
-| `/secrets` | Secret inventory, EC2 instance-profile flow, EKS IRSA + CSI flow, policy excerpt |
-| `/runbook` | 13 searchable entries: symptom → likely cause → commands → corrective action |
+## 1. Architecture
 
-## Running locally
-
-```bash
-npm install
-# DATABASE_URL points at the local PostgreSQL instance
-npm run dev
+```
+                       users / corporate network
+                                  |
+                     HTTPS 443 (HTTP 80 -> redirect)
+                                  v
+                    +----------------------------+
+                    |  Public ALB (module alb)   |   ACM cert (existing)
+                    |  tg: wildfly-http 8080     |   access logs -> S3
+                    +-------------+--------------+
+                                  |
+              +-------------------+-------------------+
+              |                                       |
+     +--------v--------+                     +--------v--------+
+     | EC2 WildFly #1  |  private subnet A   | EC2 WildFly #2  |  private subnet B
+     | ASG min 2/prod3 |                     | (ASG, no SSH)   |
+     +--------+--------+                     +--------+--------+
+              |                                       |
+              |  HTTPS (internal ALB) + JDBC/TLS       |
+              v                                       v
+     +--------------------------+          +-----------------------------+
+     | EKS: ehd-apps namespace  |          | EXISTING (external)         |
+     | order-service (2..6)     |  ----->  | Oracle RDS primary :1521    |
+     | notification-service (2) |  ----->  | DocumentDB :27017           |
+     | kafka-consumer (2..6)    |  ----->  | Kafka 9093 (SASL_SSL)       |
+     | internal ALB via ingress |  ----->  | SFTP :22                    |
+     +--------------------------+          +-----------------------------+
+              |  images
+              v
+     ECR  ehd-<env>/order-service:release-<sha>  (IMMUTABLE tags)
 ```
 
-The portal self-bootstraps its schema and seed inventory on first request
-(`src/db/bootstrap.ts`), so there is no separate migration step for the demo.
-`npm run build` + `npm start` runs the production server, and `/api/health`
-verifies the database connection.
+Full component and network detail: [`docs/OPERATIONS.md`](docs/OPERATIONS.md).
+Issue-by-issue fixes: [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md).
 
-## API surface
+### Traffic flow, end to end
 
-| Method | Route | Purpose |
+1. Client resolves the application hostname (DNS owned by the network team) to
+   the public ALB. Port 80 only redirects to 443.
+2. The ALB forwards to a healthy WildFly target on `:8080`. Targets are
+   registered by the Auto Scaling Group, health is `GET /health/ready`.
+3. WildFly authenticates to Oracle with a password read from Secrets Manager at
+   boot (instance profile), stores documents in S3 via the instance role, and
+   exchanges files with the external SFTP server.
+4. For business calls to microservices, WildFly uses the internal ingress
+   hostname. The AWS Load Balancer Controller provisions an **internal** ALB
+   from `kubernetes/order-service/ingress.yaml`.
+5. In-cluster calls use Kubernetes Service DNS
+   (`http://notification-service:8080`), never pod IPs.
+6. Kafka consumers run as separate Deployments, joining a consumer group and
+   committing offsets while reading from the existing Kafka brokers.
+7. Images are pulled from ECR using the node role; the pod's **own** identity
+   (IRSA) is only used for Secrets Manager and S3.
+
+## 2. Repository layout
+
+```
+terraform/modules/{vpc,security-groups,alb,ec2,eks,ecr,secrets-manager}
+terraform/environments/{uat,prod}      # independent state + tfvars
+kubernetes/{base,order-service,notification-service,kafka-consumer}
+jenkins/Jenkinsfile.{main-app,microservice,terraform}
+monitoring/{uat,prod}
+services/order-service                 # reference Spring Boot service
+scripts/deploy-wildfly.sh              # runs on the instance via SSM
+docs/{OPERATIONS,TROUBLESHOOTING}.md
+```
+
+## 3. Terraform modules (seven, no more)
+
+| Module | Creates | Key decision |
 | --- | --- | --- |
-| `GET` | `/api/health` | database health probe |
-| `GET` | `/api/deployments` | deployment feed joined with component/environment |
-| `POST` | `/api/deployments` | record a deployment; **rejects production without a change reference**, rejects a repeat version |
-| `POST` | `/api/deployments/:id/rollback` | restore the previous successful release and record the rollback |
-| `GET` | `/api/runbook?q=&category=` | full-text-ish runbook search across symptom, cause, commands and fix |
+| `vpc` | VPC, 2 public + 2 private subnets, IGW, NAT, route tables | Two AZs, egress-only private subnets; no VPC endpoints module |
+| `security-groups` | ALB, WildFly, EKS node groups | SG-to-SG references, not CIDRs between tiers; SSH disabled |
+| `alb` | ALB, HTTPS listener, redirect, target group | Stickiness on while sessions are local; drain delay 30s |
+| `ec2` | Launch template, ASG, instance profile + policy | IMDSv2 required, SSM instead of SSH, instance refresh for rolling boot |
+| `eks` | Cluster, OIDC provider, managed node group, core add-ons | IRSA enabled here because ServiceAccounts need it |
+| `ecr` | One repo per image, lifecycle policy | `IMMUTABLE` tags make rollback trustworthy |
+| `secrets-manager` | Secret containers, CMK, resource policy | Values injected by CI; only listed roles may read |
 
-## Data model (Drizzle + PostgreSQL)
+IAM lives inside the modules that use it (EC2 instance profile, EKS cluster/node
+roles). Everything else is documented as centrally managed. There is **no**
+module for backup, CloudWatch, IAM, autoscaling, target groups, node groups or
+VPC endpoints.
 
-| Table | Contents |
-| --- | --- |
-| `environments` | UAT/PROD account, VPC, capacities, monitoring stack, Terraform role and state key |
-| `components` | WildFly ASG, the two Spring Boot services and the Kafka consumer |
-| `deployments` | Version, immutable image tag, status, actor, change reference, duration; drives the console history and workload health |
-| `runbooks` | 13 troubleshooting entries reused by the UI and the JSON API |
-| `manifests` | Kubernetes files with purpose, explanation and a representative excerpt |
-| `secret_inventory` | Secret path, consumer, payload shape, owner/rotation, access path |
-| `artifacts` | Curated repository map shown on the infrastructure page |
+### UAT vs PROD
 
-The Terraform/Kubernetes/Jenkins files remain the source of truth for
-infrastructure; the database stores the inventory and operational records the
-console reads and writes.
+| | UAT | PROD |
+| --- | --- | --- |
+| State key | `env/uat/terraform.tfstate` | `env/prod/terraform.tfstate` |
+| NAT / nodes | 1 NAT, SPOT `m6i.large` 2–6 | 2 NATs, ON_DEMAND `m6i.xlarge` 3–8 |
+| WildFly | `t3.large` min 2 | `t3.xlarge` min 3, tag-conditioned role assumption |
+| EKS API | public, restricted CIDRs | private only |
+| Secrets recovery | 0 days | 30 days |
+| Terraform role | `ehd-uat-terraform-deploy` | `ehd-prod-terraform-deploy` |
+| Monitoring | Prometheus/Grafana/Alertmanager | Dynatrace + CloudWatch |
 
-## Design boundaries
+## 4. Jenkins delivery flow
 
-- No AWS credentials are required to review this project. Endpoints in the
-  Terraform variables, ConfigMap and manifests are explicit `REPLACE-…`
-  placeholders — the implementation never invents an Oracle, DocumentDB, Kafka or
-  SFTP endpoint.
-- Oracle RDS, DocumentDB, Kafka and SFTP are **existing** dependencies; no
-  Terraform module creates them, and CloudFront, WAF, API Gateway, Route 53, MSK
-  and GoldenGate are deliberately out of scope.
-- The portal never calls AWS. The "run deploy" action writes a deployment record
-  and applies the same production change-reference rule as the Jenkins pipeline.
+```
+main-app:    checkout -> build+test -> sonar+OWASP -> WAR -> JFrog -> [approval] -> WildFly via SSM -> ALB target health
+microservice:checkout -> mvn test  -> sonar       -> docker build -> trivy -> ECR immutable tag -> [approval] -> kubectl set image -> rollout status -> smoke
+terraform:   checkout -> fmt -check -> init -> validate -> trivy config -> plan -> [approval] -> apply saved plan
+```
+
+- AWS access is **STS AssumeRole** through the AWS Steps plugin. There are no
+  permanent keys in Jenkins or in the repository.
+- `ehd-app-deploy` (applications) is separate from
+  `ehd-<env>-terraform-deploy` (infrastructure). The infra role cannot read
+  secret values; the app role cannot create infrastructure.
+- Details and trust policies: [`jenkins/README.md`](jenkins/README.md).
+
+## 5. Kubernetes resources
+
+One namespace `ehd-apps` with PSA `restricted`. For each service: Deployment
+(2+ replicas, `maxUnavailable: 0`, startup/readiness/liveness probes,
+requests+limits, non-root, read-only root FS, dropped capabilities), ClusterIP
+Service, HPA, PDB. An internal ALB Ingress only where HTTP is required
+(`order-service`). Kafka consumers get their own Deployment, HPA and PDB but no
+Service. Secrets arrive through the Secrets Store CSI driver; ServiceAccounts
+carry the IRSA annotation. Explanation per file:
+[`kubernetes/README.md`](kubernetes/README.md).
+
+## 6. Secrets and IAM access flow
+
+1. Terraform creates secret containers under `ehd/<env>/*` with a CMK and a
+   resource policy that allows only the listed workload roles.
+2. Values are written by CI (`TF_VAR_secret_values` from Jenkins credentials) or
+   by the owning team (DBA, integration) via the console/CLI.
+3. **WildFly:** the instance profile has `secretsmanager:GetSecretValue` on those
+   three ARNs only, plus `s3:Put/GetObject` under `main-app/` and SSM messages.
+4. **Microservices:** the pod's ServiceAccount assumes an IRSA role whose trust
+   policy is pinned to `system:serviceaccount:ehd-apps:<service>`. The CSI
+   driver fetches only that service's secret and mounts it in the container.
+5. Nothing sensitive exists in Git, Jenkinsfiles, Dockerfiles, ConfigMaps or
+   `.tfvars`. `tfvars` files contain endpoints and ARNs, which are not secrets.
+
+## 7. Monitoring and logging
+
+- **UAT:** Prometheus + Grafana + Alertmanager + node-exporter +
+  kube-state-metrics + JMX exporter for WildFly.
+- **PROD:** Dynatrace (APM, JVM, infra, distributed tracing) and CloudWatch
+  (AWS metrics, EKS control-plane logs). See [`monitoring/`](monitoring/).
+- **Log archive:** CloudWatch subscription → Firehose → S3, KMS-encrypted,
+  lifecycle to Glacier IR and 7-year expiry. An archive is **not a backup**.
+- ALB access logs go directly to S3 from the load balancer.
+
+## 8. Connectivity with existing dependencies
+
+| Dependency | Port | Path | Change needed |
+| --- | --- | --- | --- |
+| Oracle RDS primary | 1521/tcp TLS | private subnet → TGW/peering | DB team whitelists the app subnet CIDRs; schema + user created by DBA |
+| DocumentDB | 27017/tcp TLS | private subnet → peering | `documentdb.host` variable; TLS CA bundle on the instance |
+| Kafka (external) | 9093/tcp SASL_SSL | NAT or peering | broker firewall for node + NAT EIPs; SCRAM user in Secrets Manager |
+| SFTP | 22/tcp | NAT egress | partner whitelists our egress IPs; key/credential in Secrets Manager |
+| EKS API (CI) | 443 | VPN/private link | Jenkins agent network access, `aws eks update-kubeconfig` |
+
+Fill `external_dependency_cidrs` and the endpoint variables; the modules never
+invent hostnames. Placeholders say `REPLACE-…` on purpose.
+
+## 9. Deployment and rollback
+
+**Microservice deploy** (Jenkins does this):
+```bash
+aws eks update-kubeconfig --name ehd-prod --region eu-west-1
+kubectl -n ehd-apps set image deployment/order-service \
+  order-service=<ecr>/ehd-prod/order-service:release-<sha>
+kubectl -n ehd-apps rollout status deployment/order-service --timeout=240s
+kubectl -n ehd-apps rollout undo deployment/order-service    # rollback
+kubectl -n ehd-apps rollout history deployment/order-service
+```
+Rollback is safe because ECR tags are immutable and the previous ReplicaSet is
+retained (`revisionHistoryLimit: 5`).
+
+**Main app deploy** (Jenkins does this): WAR → S3 → SSM RunCommand
+`/opt/ehd/bin/deploy-wildfly.sh <version>`, which keeps the previous WAR and
+restores it automatically if `/health/ready` does not come up. The ALB only sends
+traffic to healthy targets, so a bad instance never serves users.
+
+**Infrastructure change:** always `plan` first, review the artifact, then apply
+the saved plan. Roll back with the previous commit (`git revert` + plan/apply),
+never by editing the console.
+
+## 10. Validation commands
+
+```bash
+terraform -chdir=terraform/environments/uat fmt -check -recursive
+terraform -chdir=terraform/environments/uat init -backend=false && terraform -chdir=terraform/environments/uat validate
+trivy config terraform/environments/uat
+kubectl apply --dry-run=client -f kubernetes/
+kubectl kustomize >/dev/null 2>&1 || true   # not used; confirms plain YAML only
+kubectl -n ehd-apps get deploy,pods,hpa,pdb
+aws elbv2 describe-target-health --target-group-arn <tg-arn>
+```
+
+## 11. Assumptions and design decisions
+
+- DNS, ACM certificates, central S3 buckets, Transit Gateway/peering, the
+  Secrets Store CSI driver, External Secrets Operator, the AWS Load Balancer
+  Controller, metrics-server, Dynatrace Operator and Jenkins itself are
+  **platform prerequisites** — documented, not provisioned here.
+- Two AZs are enough for this workload; a third is a capacity decision, not an
+  architectural one.
+- Session affinity is enabled on the ALB because the main app still keeps HTTP
+  sessions locally. The follow-up ticket is to externalise sessions.
+- Kubernetes secret values are not duplicated in Terraform except for the
+  container + policy. One owner per secret.
+- The reference `order-service` is intentionally tiny: the platform contract
+  (probes, config, security context, image) is the point, not the business logic.
+
+## 12. Backup and disaster recovery (responsibility split)
+
+| Asset | Owner | Mechanism | RPO / RTO |
+| --- | --- | --- | --- |
+| Oracle RDS primary | DBA | Automated backups + PITR, cross-region snapshot copy (existing) | per DB contract |
+| DocumentDB | Data platform | Existing snapshot policy | per contract |
+| Kafka topics | Integration | Broker-side retention / replication (existing) | per contract |
+| S3 documents | App + platform | Versioning + cross-region replication (existing bucket policy) | 15 min / 4 h |
+| Terraform state | Platform | S3 versioning + lock; state is reproducible from Git | 0 / 1 h |
+| Kubernetes workloads | Platform | Git is the source of truth; rebuild from manifests | 0 / 2 h |
+| Log archive | Security | S3 lifecycle, encrypted | not a backup |
+
+Recovery order: infrastructure (`terraform apply`) → secrets availability →
+EKS workloads → WildFly ASG → DNS/ALB verification. Full detail in
+[`docs/OPERATIONS.md`](docs/OPERATIONS.md).
+
+## 13. Explicitly out of scope
+
+CloudFront, AWS WAF, API Gateway, Route 53, Amazon MSK, Oracle RDS (primary and
+read replica), DocumentDB and GoldenGate are **not provisioned** by this project.
+They are existing enterprise services consumed through endpoints and variables.
